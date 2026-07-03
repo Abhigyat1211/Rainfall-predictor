@@ -8,14 +8,14 @@ from transformer import process_realtime_input
 st.set_page_config(page_title="Geospatial Rain Engine", page_icon="🌧️", layout="wide")
 
 CITY_COORDINATES = {
-    "Adelaide":   {"lat": -34.9285, "lon": 138.6007},
-    "Brisbane":   {"lat": -27.4698, "lon": 153.0251},
-    "Canberra":   {"lat": -35.2809, "lon": 149.1300},
-    "Darwin":     {"lat": -12.4634, "lon": 130.8456},
-    "Melbourne":  {"lat": -37.8136, "lon": 144.9631},
-    "Newcastle":  {"lat": -32.9284, "lon": 151.7817},
-    "Perth":      {"lat": -31.9505, "lon": 115.8605},
-    "Sydney":     {"lat": -33.8688, "lon": 151.2093},
+    "Adelaide": {"lat": -34.9285, "lon": 138.6007},
+    "Brisbane": {"lat": -27.4698, "lon": 153.0251},
+    "Canberra": {"lat": -35.2809, "lon": 149.1300},
+    "Darwin": {"lat": -12.4634, "lon": 130.8456},
+    "Melbourne": {"lat": -37.8136, "lon": 144.9631},
+    "Newcastle": {"lat": -32.9284, "lon": 151.7817},
+    "Perth": {"lat": -31.9505, "lon": 115.8605},
+    "Sydney": {"lat": -33.8688, "lon": 151.2093},
     "Wollongong": {"lat": -34.4278, "lon": 150.8931},
 }
 
@@ -25,6 +25,22 @@ CITY_COORDINATES = {
 COASTAL_CITIES = {"Sydney", "Newcastle", "Wollongong"}
 COASTAL_THRESHOLD = 0.65
 DEFAULT_THRESHOLD = 0.50
+
+# How far ahead the date picker allows the user to select a target date.
+MAX_DAYS_AHEAD = 14
+
+# Open-Meteo's forecast endpoint defaults to 7 days and never includes
+# yesterday unless `past_days` is set. Since we always look up
+# (target_date - 1 day), and target_date can be up to MAX_DAYS_AHEAD days
+# out, we need:
+#   - past_days=1        -> so "yesterday relative to today" is present
+#                            (needed when target_date == today)
+#   - forecast_days=16    -> Open-Meteo's max, so "target_date - 1" is
+#                            present even when target_date == today + 14
+# This guarantees every selectable target date maps to a *distinct* day
+# in the API response, instead of silently collapsing onto today's data.
+API_PAST_DAYS = 1
+API_FORECAST_DAYS = 16
 
 
 def degrees_to_compass(degrees):
@@ -72,7 +88,7 @@ model, scaler, location_encoder, global_mean = load_production_pipeline()
 with st.sidebar:
     st.header("📊 Model Evaluation Metrics")
     st.metric(label="Model Accuracy", value="78.00%")
-    st.metric(label="ROC-AUC Score", value="0.8571")       # updated from 0.8536
+    st.metric(label="ROC-AUC Score", value="0.8571")  # updated from 0.8536
     col1, col2 = st.columns(2)
     col1.metric(label="Precision (Rain)", value="50.00%")
     col2.metric(label="Recall (Rain)", value="76.00%")
@@ -96,8 +112,7 @@ with st.container():
         )
 
         today = datetime.date.today()
-        max_date = today + datetime.timedelta(days=14)
-
+        max_date = today + datetime.timedelta(days=MAX_DAYS_AHEAD)
         target_date = st.date_input(
             "Select Prediction Date (Target Day):",
             today,
@@ -135,6 +150,8 @@ if run_forecast:
             f"precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant"
             f"&hourly=temperature_2m,relative_humidity_2m,pressure_msl,cloud_cover,"
             f"wind_speed_10m,wind_direction_10m"
+            f"&past_days={API_PAST_DAYS}"
+            f"&forecast_days={API_FORECAST_DAYS}"
             f"&timezone=auto"
         )
 
@@ -147,12 +164,25 @@ if run_forecast:
                 daily = response['daily']
                 hourly = response.get('hourly', {})
 
-                # Locate the correct day index inside the API response
-                try:
-                    date_list = daily['time']
-                    day_idx = date_list.index(base_date.strftime("%Y-%m-%d"))
-                except ValueError:
-                    day_idx = 0
+                # Locate the correct day index inside the API response.
+                # With past_days=1 and forecast_days=16 above, base_date should
+                # always be present for any target_date the user could have
+                # picked (today .. today+14). If it's ever missing, that's a
+                # real problem (e.g. API contract changed) — surface it instead
+                # of silently reusing today's data, which is what caused
+                # identical probabilities across different target dates before.
+                date_list = daily.get('time', [])
+                if base_date.strftime("%Y-%m-%d") not in date_list:
+                    st.error(
+                        f"⚠️ Forecast data for {base_date.strftime('%B %d, %Y')} "
+                        f"was not returned by the weather API (got range "
+                        f"{date_list[0] if date_list else 'N/A'} to "
+                        f"{date_list[-1] if date_list else 'N/A'}). "
+                        f"Please try again or pick a different date."
+                    )
+                    st.stop()
+
+                day_idx = date_list.index(base_date.strftime("%Y-%m-%d"))
 
                 # Hourly index = day offset × 24 + hour-of-day.
                 # timezone=auto means the list is already in local time so
@@ -172,28 +202,27 @@ if run_forecast:
                 cloud_oktas = raw_cloud_pct / 12.5
 
                 payload = {
-                    'Location':      selected_city,
-                    'Date':          base_date.strftime("%Y-%m-%d"),
-                    'Rainfall':      safe_daily(daily,  'precipitation_sum',          day_idx,  default=0),
-                    'WindGustSpeed': safe_daily(daily,  'wind_gusts_10m_max',         day_idx,  default=30),
-                    'WindSpeed9am':  safe_hourly(hourly,'wind_speed_10m',             hour_9am, default=13),
-                    'WindSpeed3pm':  safe_hourly(hourly,'wind_speed_10m',             hour_3pm, default=19),
-                    'Humidity9am':   safe_hourly(hourly,'relative_humidity_2m',       hour_9am, default=65),
-                    'Humidity3pm':   safe_hourly(hourly,'relative_humidity_2m',       hour_3pm, default=50),
-                    'Pressure9am':   safe_hourly(hourly,'pressure_msl',               hour_9am, default=1016),
-                    'Pressure3pm':   safe_hourly(hourly,'pressure_msl',               hour_3pm, default=1015),
-                    'Cloud3pm':      cloud_oktas,
-                    'MaxTemp':       safe_daily(daily,  'temperature_2m_max',         day_idx,  default=22),
-                    'MinTemp':       safe_daily(daily,  'temperature_2m_min',         day_idx,  default=12),
-                    'Temp3pm':       safe_hourly(hourly,'temperature_2m',             hour_3pm, default=20),
-                    'Sunshine':      sunshine_hours,
+                    'Location': selected_city,
+                    'Date': base_date.strftime("%Y-%m-%d"),
+                    'Rainfall': safe_daily(daily, 'precipitation_sum', day_idx, default=0),
+                    'WindGustSpeed': safe_daily(daily, 'wind_gusts_10m_max', day_idx, default=30),
+                    'WindSpeed9am': safe_hourly(hourly, 'wind_speed_10m', hour_9am, default=13),
+                    'WindSpeed3pm': safe_hourly(hourly, 'wind_speed_10m', hour_3pm, default=19),
+                    'Humidity9am': safe_hourly(hourly, 'relative_humidity_2m', hour_9am, default=65),
+                    'Humidity3pm': safe_hourly(hourly, 'relative_humidity_2m', hour_3pm, default=50),
+                    'Pressure9am': safe_hourly(hourly, 'pressure_msl', hour_9am, default=1016),
+                    'Pressure3pm': safe_hourly(hourly, 'pressure_msl', hour_3pm, default=1015),
+                    'Cloud3pm': cloud_oktas,
+                    'MaxTemp': safe_daily(daily, 'temperature_2m_max', day_idx, default=22),
+                    'MinTemp': safe_daily(daily, 'temperature_2m_min', day_idx, default=12),
+                    'Temp3pm': safe_hourly(hourly, 'temperature_2m', hour_3pm, default=20),
+                    'Sunshine': sunshine_hours,
                     # degrees_to_compass returns None for missing data; the transformer
                     # then correctly maps None -> NaN -> sin=0, cos=0 (matches training).
-                    'WindGustDir':   degrees_to_compass(safe_daily(daily,  'wind_direction_10m_dominant', day_idx,  default=None)),
-                    'WindDir9am':    degrees_to_compass(safe_hourly(hourly,'wind_direction_10m',          hour_9am, default=None)),
-                    'WindDir3pm':    degrees_to_compass(safe_hourly(hourly,'wind_direction_10m',          hour_3pm, default=None)),
+                    'WindGustDir': degrees_to_compass(safe_daily(daily, 'wind_direction_10m_dominant', day_idx, default=None)),
+                    'WindDir9am': degrees_to_compass(safe_hourly(hourly, 'wind_direction_10m', hour_9am, default=None)),
+                    'WindDir3pm': degrees_to_compass(safe_hourly(hourly, 'wind_direction_10m', hour_3pm, default=None)),
                 }
-
                 payload['RainToday'] = 'Yes' if payload['Rainfall'] > 1.0 else 'No'
 
                 processed_vector = process_realtime_input(
@@ -218,7 +247,6 @@ if run_forecast:
 
                 res_col1, res_col2 = st.columns(2)
                 res_col1.metric("Rain Probability", f"{probability:.1%}")
-
                 if selected_city in COASTAL_CITIES:
                     res_col1.caption(f"Coastal threshold: {COASTAL_THRESHOLD:.0%}")
 
